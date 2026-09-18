@@ -2,6 +2,32 @@
 
 An independent Linux service that limits local workloads launched by Codex and Claude. No wrappers or instructions for agents are required. Uses the Python 3.12 standard library, systemd 255, cgroups v2, and the process connector.
 
+## Quick install
+
+Run this from the account whose agents you want to limit. No Git clone is needed:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AlexMog/agent-guard/main/install.sh | bash
+```
+
+The script checks prerequisites, downloads a pinned runtime revision over HTTPS, validates and extracts the archive in a temporary directory, and invokes the installer with `sudo` when needed. New installations enable the default **15 GiB memory budget and 50% CPU cap**. Running the command again updates an existing installation while preserving its configuration and state. Temporary downloads are removed on success or failure.
+
+Requirements: Linux running systemd 255+, `/usr/bin/python3` 3.12+, cgroups v2 with `cpuset`, `cpu`, `memory`, and `pids`, and `curl`. Administrator access is required to install. The installer tests kernel process-connector support before changing the system. Missing dependencies are reported; the script does not change package manager configuration.
+
+To start in observation mode, without applying limits:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AlexMog/agent-guard/main/install.sh | bash -s -- --observe
+```
+
+To check prerequisites and the download without installing or requesting administrator access:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AlexMog/agent-guard/main/install.sh | bash -s -- --check
+```
+
+`--check` does not run privileged kernel tests. `--observe` applies only to fresh installations. Use `--uid UID` to select another local, non-root account; when running directly as root without `SUDO_UID`, this option is required. After installation, run `agent-guard status`.
+
 ## Policy
 
 - Recognizes installed agent executables, verifies ancestry through `/proc`, reads `fork/exec/exit` events in a dedicated thread with a bounded buffer, and performs a full reconciliation every 30 seconds.
