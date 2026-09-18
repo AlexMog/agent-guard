@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.*
+!.env.example
+*.log
+*.jsonl
+state.json
+status.json
+snapshot-*.json
+/docs/superpowers/
+/docs/validation-*.md

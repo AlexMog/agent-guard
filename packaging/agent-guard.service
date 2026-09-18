@@ -1,0 +1,38 @@
+[Unit]
+Description=Conservative resource guard for verified local agent workloads
+After=local-fs.target
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/python3 -I /usr/local/lib/agent-guard/main.py daemon
+Restart=on-failure
+RestartSec=5
+User=root
+Group=root
+UMask=0022
+StateDirectory=agent-guard
+StateDirectoryMode=0755
+Delegate=cpu memory pids
+DelegateSubgroup=supervisor
+# Adopted workloads must survive stopping/restarting this supervisor.
+KillMode=process
+TimeoutStopSec=15
+OOMPolicy=continue
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/sys/fs/cgroup /var/lib/agent-guard
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_KILL CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target
