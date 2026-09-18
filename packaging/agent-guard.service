@@ -14,7 +14,7 @@ Group=root
 UMask=0022
 StateDirectory=agent-guard
 StateDirectoryMode=0755
-Delegate=cpu memory pids
+Delegate=cpuset cpu memory pids
 DelegateSubgroup=supervisor
 # Adopted workloads must survive stopping/restarting this supervisor.
 KillMode=process

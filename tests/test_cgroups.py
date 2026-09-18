@@ -86,5 +86,67 @@ class SafetyTests(unittest.TestCase):
                 send.assert_not_called()
 
 
+class CpuBoundaryTests(unittest.TestCase):
+    def test_shared_parent_caps_control_and_work_without_shrinking_on_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            parent = Path(d)
+            (parent / 'cpuset.cpus.effective').write_text('0-15')
+            root = parent / 'guard'
+            (root / 'work').mkdir(parents=True)
+            (root / 'cpu.max').write_text('max 100000')
+            (root / 'work/cpu.max').write_text('800000 100000')
+            (root / 'cpuset.cpus').write_text('0-7')
+            cg = Cgroups(root, Mock())
+            with patch('os.cpu_count', return_value=16):
+                cg.configure_cpu(0.5)
+                cg.configure_cpu(0.5)
+            self.assertEqual((root / 'cpu.max').read_text(), '800000 100000')
+            self.assertEqual((root / 'work/cpu.max').read_text(), 'max 100000')
+            self.assertEqual((root / 'cpuset.cpus').read_text(), '0,1,2,3,4,5,6,7')
+            cg.release_cpu()
+            self.assertEqual((root / 'cpu.max').read_text(), 'max 100000')
+            self.assertEqual((root / 'cpuset.cpus').read_text().strip(), '0-15')
+
+    def test_sparse_parent_cpu_set_is_respected(self):
+        with tempfile.TemporaryDirectory() as d:
+            parent = Path(d)
+            (parent / 'cpuset.cpus.effective').write_text('2-3,8,10-12')
+            root = parent / 'guard'
+            (root / 'work').mkdir(parents=True)
+            (root / 'cpu.max').write_text('max 100000')
+            (root / 'work/cpu.max').write_text('max 100000')
+            (root / 'cpuset.cpus').touch()
+            with patch('os.cpu_count', return_value=8):
+                Cgroups(root, Mock()).configure_cpu(0.5)
+            self.assertEqual((root / 'cpuset.cpus').read_text(), '2,3,8,10')
+
+    def test_failed_configuration_restores_preexisting_limits(self):
+        with tempfile.TemporaryDirectory() as d:
+            parent = Path(d)
+            (parent / 'cpuset.cpus.effective').write_text('0-15')
+            root = parent / 'guard'
+            (root / 'work').mkdir(parents=True)
+            original = {root / 'cpu.max': 'max 100000',
+                        root / 'work/cpu.max': '800000 100000', root / 'cpuset.cpus': '0-15'}
+            for p, text in original.items():
+                p.write_text(text)
+            write = Path.write_text
+            def fail_work(path, text, *args, **kwargs):
+                if path == root / 'work/cpu.max':
+                    raise OSError('injected write failure')
+                return write(path, text, *args, **kwargs)
+            with patch.object(Path, 'write_text', fail_work), patch('os.cpu_count', return_value=16):
+                with self.assertRaises(OSError):
+                    Cgroups(root, Mock()).configure_cpu(0.5)
+            self.assertEqual({p:p.read_text() for p in original}, original)
+
+    def test_missing_cpuset_refuses_silent_production_downgrade(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'work').mkdir()
+            with self.assertRaises(RuntimeError):
+                Cgroups(root, Mock()).configure_cpu(0.5)
+
+
 if __name__ == '__main__':
     unittest.main()

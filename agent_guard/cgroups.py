@@ -58,15 +58,55 @@ class Cgroups:
         # No tasks may remain in the delegation root before enabling controllers.
         if (root / 'cgroup.procs').read_text().strip():
             raise RuntimeError('unexpected processes in delegation root')
-        (root / 'cgroup.subtree_control').write_text('+cpu +memory +pids')
+        controllers = '+cpu +memory +pids'
+        if 'cpuset' in (root / 'cgroup.controllers').read_text().split():
+            controllers += ' +cpuset'
+        (root / 'cgroup.subtree_control').write_text(controllers)
         for name in ('control', 'work'):
             group = root / name
             group.mkdir(exist_ok=True)
-            (group / 'cgroup.subtree_control').write_text('+cpu +memory +pids')
-        quota = max(1000, round((os.cpu_count() or 1) * cpu_fraction * 100000))
-        (root / 'work' / 'cpu.max').write_text(f'{quota} 100000')
+            (group / 'cgroup.subtree_control').write_text(controllers)
+        (supervisor / 'cpu.weight').write_text('10000')
+        result.configure_cpu(cpu_fraction, require_cpuset=os.geteuid() == 0)
         # Intentionally no memory.max on the shared tree: no arbitrary OOM victim.
         return result
+
+    def configure_cpu(self, cpu_fraction, require_cpuset=True):
+        cpuset = self.root / 'cpuset.cpus'
+        if require_cpuset and not cpuset.exists():
+            raise RuntimeError('cpuset delegation required for the shared CPU boundary')
+        capacity = (os.cpu_count() or 1) * cpu_fraction
+        settings = {}
+        if cpuset.exists():
+            # Read the parent, not our previous restriction, on restart.
+            available = set()
+            for item in (self.root.parent / 'cpuset.cpus.effective').read_text().strip().split(','):
+                bounds = [int(x) for x in item.split('-')]
+                available.update(range(bounds[0], bounds[-1] + 1))
+            chosen = sorted(available)[:max(1, int(capacity))]
+            if not chosen:
+                raise RuntimeError('no online CPUs available in parent cgroup')
+            settings[cpuset] = ','.join(map(str, chosen))
+        quota = max(1000, round(capacity * 100000))
+        # The common ancestor covers new children still in control, too.
+        settings[self.root / 'cpu.max'] = f'{quota} 100000'
+        # Remove the old work-only limit during upgrades.
+        settings[self.root / 'work' / 'cpu.max'] = 'max 100000'
+        original = {path: path.read_text() for path in settings}
+        try:
+            for path, value in settings.items():
+                path.write_text(value)
+        except OSError:
+            for path, value in original.items():
+                try:
+                    # Some kernels reject clearing an occupied cpuset. Restore
+                    # its inherited CPUs explicitly in that case.
+                    if path == cpuset and not value.strip():
+                        value = (self.root.parent / 'cpuset.cpus.effective').read_text()
+                    path.write_text(value)
+                except OSError:
+                    pass
+            raise
 
     @property
     def relative(self):
@@ -169,6 +209,10 @@ class Cgroups:
 
     def release_cpu(self):
         (self.root / 'work' / 'cpu.max').write_text('max 100000')
+        (self.root / 'cpu.max').write_text('max 100000')
+        if (self.root / 'cpuset.cpus').exists():
+            (self.root / 'cpuset.cpus').write_text(
+                (self.root.parent / 'cpuset.cpus.effective').read_text())
 
     def prune_empty(self):
         for parent in ('work', 'control'):

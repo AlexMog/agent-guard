@@ -64,6 +64,7 @@ class Daemon:
             'memory_bytes': self.total, 'swap_bytes': self.swap, 'measurement_complete': self.complete,
             'limit_bytes': self.config.memory_bytes, 'cpu_fraction': self.config.cpu_fraction,
             'cpu_cap_active': bool(self.cg) and self.running, 'cgroup': str(self.cg.root) if self.cg else None,
+            'cpu_scope': 'all-tracked-processes-including-agents-and-helpers',
             'observation_remaining_seconds': max(0, round(self.config.observation_seconds - (time.monotonic() - self.started))),
             'sessions': self.registry.sessions,
             'jobs': [asdict(j) for j in self.registry.jobs.values() if j.id in active_jobs],

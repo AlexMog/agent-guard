@@ -152,16 +152,16 @@ def run():
         job.pss, job.swap = memory
         print(f'PASS: attachment and post-migration PSS ({job.pss} bytes)', flush=True)
 
-        quota = (cg.root / 'work' / 'cpu.max').read_text().split()
+        quota = (cg.root / 'cpu.max').read_text().split()
         require(quota == ['25000', '100000'], f'unexpected cpu.max: {quota}')
         burner, burner_identity = spawn('burn')
         _, burner_path, _ = attach(burner_identity)
-        before = fields(cg.root / 'work' / 'cpu.stat')
+        before = fields(cg.root / 'cpu.stat')
         burner.stdin.write('go\n')
         burner.stdin.flush()
         measurement = json.loads(line_from(burner, timeout=6))
         require(burner.wait(timeout=2) == 0, 'CPU burner failed')
-        after = fields(cg.root / 'work' / 'cpu.stat')
+        after = fields(cg.root / 'cpu.stat')
         require(int(after['nr_throttled']) > int(before['nr_throttled']),
                 'cpu.stat recorded no quota throttling')
         require(int(after['throttled_usec']) > int(before['throttled_usec']),
