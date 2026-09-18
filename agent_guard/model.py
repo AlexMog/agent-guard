@@ -29,11 +29,32 @@ def is_agent(p):
     )
 
 
-def is_helper(p):
+def _shell_command_index(p):
+    if p.exe.rsplit('/', 1)[-1] not in ('sh', 'bash', 'dash', 'zsh', 'ksh', 'fish'):
+        return None
+    for i, arg in enumerate(p.argv[1:], 1):
+        if arg in ('--noprofile', '--norc', '--login'):
+            continue
+        # Stop at a script filename or uncertain option syntax/operands.
+        if not re.fullmatch(r'-[abcefhiklmnprstuvxBCEHPT]+', arg):
+            return None
+        if 'c' in arg[1:]:
+            return i + 1 if i + 1 < len(p.argv) else None
+    return None
+
+
+def _helper_match(p, argv):
     # Conservative false exclusions are preferable to stopping agent plumbing.
-    labels = (p.exe, *p.argv[:12])
+    labels = (p.exe, *argv[:12])
     return (any(re.search(r'(?i)(?:mcp|codex-code-mode|chrome-native-host|claude-in-chrome|--stdio)', x) for x in labels)
             or any(re.search(r'/\.(?:claude[^/]*|codex)/plugins/', x) for x in (*labels, p.cwd)))
+
+
+def is_helper(p):
+    # A shell program can mention plugins/tests without executing a helper.
+    # Classify its actual child executable when it appears, not its script text.
+    script = _shell_command_index(p)
+    return _helper_match(p, tuple(x for i, x in enumerate(p.argv) if i != script))
 
 
 @dataclass
@@ -74,6 +95,7 @@ class Registry:
         live_keys = {p.key for p in current.values()}
         # Existing keys survive reparenting, but a reused PID never matches.
         self.members = {k: m for k, m in self.members.items() if k in live_keys}
+        repaired = self._repair_shell_false_positives(current)
         pending = sorted(current.values(), key=lambda p: (p.start, p.pid))
         for _ in range(len(pending) + 1):
             progress = False
@@ -118,6 +140,40 @@ class Registry:
             if not progress:
                 break
             pending = remaining
+        # Previously protected work must never become a new memory victim.
+        for key in repaired:
+            member = self.members.get(key)
+            if member and member.job:
+                self.jobs[member.job].baseline = True
+
+    def _repair_shell_false_positives(self, current):
+        """Recover only proven shell-text false positives from older state."""
+        repaired = set()
+        for p in current.values():
+            old = self.members.get(p.key)
+            parent = current.get(p.ppid)
+            if (old and old.protected and parent and parent.start <= p.start
+                    and is_agent(parent) and old.session == f'a-{parent.pid}-{parent.start}'
+                    and _shell_command_index(p) is not None
+                    and _helper_match(p, p.argv) and not is_helper(p)):
+                repaired.add(p.key)
+        # Preserve genuine helpers, unknown orphans and their descendants.
+        while True:
+            added = set()
+            for p in current.values():
+                parent = current.get(p.ppid)
+                old = self.members.get(p.key)
+                if (old and old.protected and parent and parent.start <= p.start
+                        and parent.key in repaired and p.key not in repaired
+                        and not is_agent(p) and not is_helper(p)
+                        and old.session == self.members[parent.key].session):
+                    added.add(p.key)
+            if not added:
+                break
+            repaired.update(added)
+        for key in repaired:
+            del self.members[key]
+        return repaired
 
     def _new_job(self, p, session):
         jid = f'j-{p.pid}-{p.start}'

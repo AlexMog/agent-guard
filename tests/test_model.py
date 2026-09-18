@@ -31,6 +31,65 @@ class ModelTests(unittest.TestCase):
                          cwd='/home/developer/.claude-example/plugins/cache/claude-plugins-official/discord/0.0.4')
         self.assertTrue(is_helper(plugin))
 
+    def test_shell_command_text_does_not_protect_workload(self):
+        for command in (
+            'source /home/developer/.claude-example/plugins/cache/tool/env.sh; pnpm vitest run',
+            'pnpm vitest run tests/mcp-client.test.ts',
+            'echo --stdio; python3 compute.py',
+        ):
+            with self.subTest(command=command):
+                r = self.registry()
+                shell = proc(20, 10, argv=('bash', '-lc', command))
+                r.reconcile([proc(10, exe=AGENT), shell, proc(30, 20, exe='/usr/bin/node')])
+                self.assertFalse(is_helper(shell))
+                self.assertIsNotNone(r.members['30:300'].job)
+                self.assertEqual(r.members['20:200'].job, r.members['30:300'].job)
+
+    def test_shell_launching_actual_helper_keeps_helper_protected(self):
+        r = self.registry()
+        r.reconcile([proc(10, exe=AGENT), proc(20, 10, argv=('bash', '-c', 'node /x/mcp-server/main.js')),
+                     proc(30, 20, exe='/usr/bin/node', argv=('node', '/x/mcp-server/main.js')), proc(40, 30)])
+        self.assertIsNotNone(r.members['20:200'].job)
+        self.assertTrue(r.members['30:300'].protected)
+        self.assertTrue(r.members['40:400'].protected)
+
+    def test_c_option_after_script_name_is_script_data_and_stays_protected(self):
+        shell = proc(20, 10, argv=('bash', '/tmp/bridge.sh', '-c', '/x/mcp-server'))
+        self.assertTrue(is_helper(shell))
+
+    def test_uncertain_shell_option_operands_remain_conservative(self):
+        for argv in (('bash', '--rcfile', '/tmp/config', '-c', 'node /x/mcp-server'),
+                     ('bash', '-o', 'posix', '-c', 'node /x/mcp-server')):
+            self.assertTrue(is_helper(proc(20, 10, argv=argv)))
+
+    def test_restore_false_shell_protection_limits_existing_work_without_kill_eligibility(self):
+        from agent_guard.model import Member
+        r = Registry(1000, 'boot', 10)
+        agent = proc(10, exe=AGENT)
+        shell = proc(20, 10, argv=('bash', '-lc', 'source /home/developer/.claude-example/plugins/tool/env.sh; pnpm vitest'))
+        worker = proc(30, 20, exe='/usr/bin/node')
+        helper = proc(40, 20, exe='/usr/bin/node', argv=('node', '/x/mcp-server/main.js'))
+        r.reconcile([agent])
+        for p in (shell, worker, helper):
+            r.members[p.key] = Member('a-10-100', None, True)
+        r = Registry.restore(r.export(), 1000, 'boot', 9000)
+        r.reconcile([agent, shell, worker, helper])
+        job = r.members[worker.key].job
+        self.assertIsNotNone(job)
+        self.assertEqual(job, r.members[shell.key].job)
+        self.assertTrue(r.jobs[job].baseline)
+        self.assertTrue(r.members[helper.key].protected)
+        self.assertIsNone(r.members[helper.key].job)
+
+    def test_false_shell_protection_not_removed_without_live_agent_parent(self):
+        from agent_guard.model import Member
+        r = self.registry()
+        r.reconcile([proc(10, exe=AGENT)])
+        shell = proc(20, 1, argv=('bash', '-lc', 'echo /home/developer/.claude-example/plugins/tool'))
+        r.members[shell.key] = Member('a-10-100', None, True)
+        r.reconcile([shell])
+        self.assertTrue(r.members[shell.key].protected)
+
     def test_ancestry_groups_whole_work_and_ignores_manual_sibling(self):
         r = self.registry()
         r.reconcile([proc(10, exe=AGENT), proc(20, 10), proc(30, 20), proc(40, 1)])
