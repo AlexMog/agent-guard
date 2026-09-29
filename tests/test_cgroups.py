@@ -148,5 +148,108 @@ class CpuBoundaryTests(unittest.TestCase):
                 Cgroups(root, Mock()).configure_cpu(0.5)
 
 
+UNIT = '/system.slice/agent-guard.service'
+
+
+class CappedSubgroupTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.fs = Path(temp.name)
+        (self.fs / 'system.slice').mkdir()
+        (self.fs / 'system.slice/cpuset.cpus.effective').write_text('0-15\n')
+        self.unit = self.fs / UNIT.lstrip('/')
+        self.capped = self.unit / 'capped'
+        (self.capped / 'work').mkdir(parents=True)
+        self.unit.chmod(0o755)
+        files = {'cgroup.procs': '', 'cgroup.controllers': 'cpuset cpu memory pids\n', 'cpu.max': 'max 100000\n',
+                 'cpuset.cpus.effective': '0-15\n', 'capped/cpu.max': 'max 100000\n',
+                 'capped/cpuset.cpus': '\n', 'capped/work/cpu.max': 'max 100000\n'}
+        for name, text in files.items():
+            (self.unit / name).write_text(text)
+        patcher = patch('agent_guard.cgroups.CGROUP_FS', self.fs)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def delegated(self):
+        proc = Mock()
+        proc.read.return_value = Process(1, 0, 1, 0, '/usr/bin/python3', (), UNIT + '/supervisor', '/', 'S', 0)
+        with patch('agent_guard.cgroups.validate_location'), patch('os.cpu_count', return_value=16):
+            return Cgroups.delegated(proc, 0.5)
+
+    def test_cap_lives_on_owned_subgroup_with_supervisor_outside(self):
+        cg = self.delegated()
+        self.assertEqual(cg.root, self.capped)
+        self.assertEqual(cg.relative, UNIT + '/capped')
+        self.assertEqual((self.capped / 'cpu.max').read_text(), '800000 100000')
+        self.assertEqual((self.capped / 'cpuset.cpus').read_text(), '0,1,2,3,4,5,6,7')
+        self.assertEqual((self.unit / 'cpu.max').read_text(), 'max 100000\n')
+        self.assertEqual((self.unit / 'supervisor/cpu.weight').read_text(), '10000')
+        for group in (self.unit, self.capped, self.capped / 'control', self.capped / 'work'):
+            self.assertIn('+cpu', (group / 'cgroup.subtree_control').read_text())
+        self.assertFalse((self.unit / 'control').exists())
+        self.assertFalse((self.unit / 'work').exists())
+        self.assertEqual(cg.job_path('j-2-20'), self.capped / 'work/j-2-20')
+        self.assertEqual(cg.session_path('a-1-10'), self.capped / 'control/a-1-10')
+
+    def test_stale_limits_on_unit_cgroup_are_reset_to_systemd_defaults(self):
+        (self.unit / 'cpu.max').write_text('800000 100000\n')
+        (self.unit / 'cpuset.cpus').write_text('0-7\n')
+        (self.unit / 'work').mkdir()
+        (self.unit / 'work/cpu.max').write_text('800000 100000\n')
+        self.delegated()
+        self.assertEqual((self.unit / 'cpu.max').read_text(), 'max 100000')
+        self.assertEqual((self.unit / 'cpuset.cpus').read_text(), '0-15\n')
+        self.assertEqual((self.unit / 'work/cpu.max').read_text(), 'max 100000')
+
+    def test_inherited_unit_cpuset_is_left_to_systemd(self):
+        (self.unit / 'cpu.max').write_text('max 100000\n')
+        (self.unit / 'cpuset.cpus').write_text('\n')
+        self.delegated()
+        self.assertEqual((self.unit / 'cpu.max').read_text(), 'max 100000\n')
+        self.assertEqual((self.unit / 'cpuset.cpus').read_text(), '\n')
+
+    def test_previous_layout_groups_move_under_capped_with_identity_checks(self):
+        session = self.unit / 'control/a-1-10'
+        job = self.unit / 'work/j-2-20'
+        for group, pids in ((session, '10\n'), (job, '20\n21\n')):
+            group.mkdir(parents=True)
+            (group / 'cgroup.procs').write_text(pids)
+            (group / 'cgroup.freeze').write_text('1')
+        members = {10: Process(10, 1, 100, 1000, '/x', (), UNIT + '/control/a-1-10', '/', 'S', 0),
+                   20: Process(20, 1, 200, 1000, '/x', (), UNIT + '/work/j-2-20', '/', 'S', 0),
+                   21: Process(21, 1, 210, 1000, '/x', (), '/user.slice/reused', '/', 'S', 0)}
+        cg = Cgroups(self.capped, Mock(read=members.get))
+        groups = cg.legacy_groups()
+        self.assertEqual(sorted(groups), [session, job])
+        with patch.object(cg, 'attach', side_effect=[True, UnsafeAction('exited during attachment')]) as attach:
+            ambiguous = cg.adopt(groups)
+        self.assertEqual(ambiguous, {'j-2-20': 'exited during attachment'})
+        self.assertEqual([c.args for c in attach.call_args_list],
+                         [(members[10], self.capped / 'control/a-1-10'), (members[20], self.capped / 'work/j-2-20')])
+        self.assertEqual((job / 'cgroup.freeze').read_text(), '0')
+        self.assertEqual((session / 'cgroup.freeze').read_text(), '0')
+
+    def test_previous_layout_directories_with_unexpected_names_are_left_alone(self):
+        for name in ('control/j-2-20', 'control/other', 'work/a-1-10', 'work/other'):
+            (self.unit / name).mkdir(parents=True)
+        (self.unit / 'work/j-2-20').mkdir()
+        self.assertEqual(Cgroups(self.capped, Mock()).legacy_groups(), [self.unit / 'work/j-2-20'])
+
+    def test_fresh_layout_has_no_previous_groups(self):
+        self.assertEqual(Cgroups(self.capped, Mock()).legacy_groups(), [])
+
+    def test_cap_status_reads_the_kernel_value_back(self):
+        cg = Cgroups(self.capped, Mock())
+        self.assertFalse(cg.cpu_capped)
+        with patch('os.cpu_count', return_value=16):
+            cg.configure_cpu(0.5)
+        self.assertTrue(cg.cpu_capped)
+        (self.capped / 'cpu.max').write_text('max 100000\n')
+        self.assertFalse(cg.cpu_capped)
+        (self.capped / 'cpu.max').unlink()
+        self.assertFalse(cg.cpu_capped)
+
+
 if __name__ == '__main__':
     unittest.main()

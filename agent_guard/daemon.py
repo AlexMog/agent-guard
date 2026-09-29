@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import signal
 import time
-from .cgroups import Cgroups, UnsafeAction
+from .cgroups import CGROUP_FS, Cgroups, UnsafeAction
 from .events import EventPump, EventLoss
 from .model import is_agent
 from .policy import Gate, choose_victim
@@ -63,7 +63,7 @@ class Daemon:
             'mode': self.config.mode, 'events_connected': self.event_ok and bool(self.events and self.events.healthy),
             'memory_bytes': self.total, 'swap_bytes': self.swap, 'measurement_complete': self.complete,
             'limit_bytes': self.config.memory_bytes, 'cpu_fraction': self.config.cpu_fraction,
-            'cpu_cap_active': bool(self.cg) and self.running, 'cgroup': str(self.cg.root) if self.cg else None,
+            'cpu_cap_active': bool(self.cg and self.cg.cpu_capped), 'cgroup': str(self.cg.root) if self.cg else None,
             'cpu_scope': 'all-tracked-processes-including-agents-and-helpers',
             'observation_remaining_seconds': max(0, round(self.config.observation_seconds - (time.monotonic() - self.started))),
             'sessions': self.registry.sessions,
@@ -81,8 +81,37 @@ class Daemon:
             else:
                 self.cache.pop(pid, None)
 
+    def quarantine(self, group):
+        """Any ambiguous attachment inhibits automatic termination for the job."""
+        if group in self.registry.jobs:
+            self.registry.jobs[group].tainted = True
+        elif group in self.registry.sessions and not self.registry.sessions[group].get('tainted'):
+            # A session attachment race could affect later inherited attribution.
+            self.registry.sessions[group]['tainted'] = True
+            for job in self.registry.jobs.values():
+                if job.session == group:
+                    job.tainted = True
+            self.event_ok = False
+
+    def mark_pending_attachments(self, jobs=(), sessions=()):
+        self.pending_attachments = {'jobs': sorted(jobs), 'sessions': sorted(sessions)} if jobs or sessions else {}
+        self.store.save('state.json', self.state())
+
+    def adopt_legacy_groups(self):
+        groups = self.cg.legacy_groups()
+        if not groups:
+            return
+        self.mark_pending_attachments([g.name for g in groups if g.parent.name == 'work'],
+                                      [g.name for g in groups if g.parent.name == 'control'])
+        for group, error in self.cg.adopt(groups).items():
+            self.quarantine(group)
+            self.store.record('attachment-rejected', group=group, error=error)
+        self.mark_pending_attachments()
+
     def reconcile(self, full=False):
         if full:
+            if self.cg:
+                self.adopt_legacy_groups()
             self.cache = {p.pid: p for p in self.proc.scan(self.config.uid)}
             self.last_scan = time.monotonic()
         # Owned groups also recover children whose parent has already exited.
@@ -108,17 +137,14 @@ class Daemon:
                 if not m:
                     continue
                 target = self.cg.job_path(m.job) if m.job else self.cg.session_path(m.session)
-                relative = '/' + str(target.relative_to('/sys/fs/cgroup'))
+                relative = '/' + str(target.relative_to(CGROUP_FS))
                 if p.cgroup == relative:
                     continue
                 moves.append((p, m, target))
             # A crash at any point in numeric migration quarantines the entire unfinished batch.
             if moves:
-                self.pending_attachments = {
-                    'jobs': sorted({m.job for _, m, _ in moves if m.job}),
-                    'sessions': sorted({m.session for _, m, _ in moves if not m.job}),
-                }
-                self.store.save('state.json', self.state())
+                self.mark_pending_attachments({m.job for _, m, _ in moves if m.job},
+                                              {m.session for _, m, _ in moves if not m.job})
             for p, m, target in moves:
                 try:
                     if self.cg.attach(p, target):
@@ -126,20 +152,10 @@ class Daemon:
                         if fresh:
                             self.cache[p.pid] = fresh
                 except (OSError, UnsafeAction) as exc:
-                    # Any ambiguous attachment inhibits automatic termination for the job.
-                    if m.job:
-                        self.registry.jobs[m.job].tainted = True
-                    else:
-                        # A session attachment race could affect later inherited attribution.
-                        self.registry.sessions[m.session]['tainted'] = True
-                        for job in self.registry.jobs.values():
-                            if job.session == m.session:
-                                job.tainted = True
-                        self.event_ok = False
+                    self.quarantine(m.job or m.session)
                     self.store.record('attachment-rejected', pid=p.pid, start=p.start, error=str(exc))
             if moves:
-                self.pending_attachments = {}
-                self.store.save('state.json', self.state())
+                self.mark_pending_attachments()
             self.cg.prune_empty()
         # Bound metadata growth; live groups retain all identities and provenance.
         active = {m.job for m in self.registry.members.values() if m.job}
@@ -215,6 +231,10 @@ class Daemon:
                 now = time.monotonic()
                 if self.events:
                     try:
+                        # Reconnecting only follows a loss, so an unhealthy pump must be treated as one.
+                        failure = self.events.failure
+                        if failure or not self.event_ok:
+                            raise EventLoss(failure or 'memory decisions paused after an ambiguous session attachment')
                         events = self.events.receive(min(0.25, max(0, next_sample - now)))
                         if events:
                             pids = {e.pid for e in events if e.pid}

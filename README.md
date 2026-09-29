@@ -32,16 +32,28 @@ curl -fsSL https://raw.githubusercontent.com/AlexMog/agent-guard/main/install.sh
 
 - Recognizes installed agent executables, verifies ancestry through `/proc`, reads `fork/exec/exit` events in a dedicated thread with a bounded buffer, and performs a full reconciliation every 30 seconds.
 - Process identity combines the PID and start time, with saved state tied to the kernel boot. Names such as `node` or `MainThread` never prove origin.
-- One group per workload. Workloads share a **15 GiB PSS memory budget**. The **50% CPU cap** applies to the common parent group of tracked agents, helpers, and workloads: their children inherit it at fork, before classification. A CPU time quota is combined with a `cpuset` restricted to half the logical processors (8 out of 16), preventing simultaneous use of every processor. The processor count is rounded down, with a minimum of one; fractions below one processor are still enforced through the CPU time quota.
+- One group per workload. Workloads share a **15 GiB PSS memory budget**. The **50% CPU cap** applies to `capped`, the group that holds every tracked agent, helper, and workload: their children inherit it at fork, before classification. A CPU time quota is combined with a `cpuset` restricted to half the logical processors (8 out of 16), preventing simultaneous use of every processor. The processor count is rounded down, with a minimum of one; fractions below one processor are still enforced through the CPU time quota.
 - Recognized agent processes, MCP/stdio/code-mode components, and plugin runtimes are protected from memory-triggered termination and excluded from the workload memory budget. They share the CPU cap. Unknown helpers may require extending `is_helper`; check the process inventory after adding a new tool.
 - The text of a shell `-c` command does not prove that it is a helper: a preamble mentioning a plugin must not exempt tests from the quota. Actual helpers are recognized when they execute. An update recovers earlier exclusions of this kind only when ancestry to the live agent can be verified; recovered workloads remain protected from memory-triggered termination.
 - **All workloads present when enforcement is enabled are protected from automatic memory-triggered termination.** This protection survives service restarts and extends to their descendants. The CPU cap also applies to these workloads.
 - **60 seconds of observation at service startup**, followed by three consecutive complete measurements above the memory budget. This is not a separate 60-second wait for each new workload.
 - Terminates the newest eligible workload with at least 64 MiB PSS. Only one termination at a time, with at least 10 seconds between decisions. Sends TERM, then KILL after three seconds if needed.
 - Before each signal, briefly freezes the group, revalidates its members and executables, and binds process identity to a pidfd. An agent, helper, or unknown member causes the action to be canceled. The audit log is written and synchronized before signaling. No `pkill`, no signaling by name or unverified PID, and no recursive `cgroup.kill`.
-- Ambiguous or interrupted migrations quarantine the group; migration markers are persisted before any migration write. Incomplete measurements or lost events suspend new memory decisions.
+- Ambiguous or interrupted migrations quarantine the group; migration markers are persisted before any migration write. Incomplete measurements or lost events suspend new memory decisions. When events are lost, the event reader stops, or a session migration is ambiguous, the service logs `event-loss`, rebuilds its view from `/proc`, and subscribes again within 10 seconds. Memory decisions resume once the kernel confirms the new subscription.
 
 The memory budget is a **monitoring threshold**, not a strict global `MemoryMax`: the latter would let the kernel choose a victim. Brief overruns are possible. If only protected workloads exceed the threshold, the service reports it without killing anything. PSS measurements include pages allocated before a process moves into a cgroup; swap is reported separately and is not capped in this version. CPU limits are enforced by the kernel: [`cpu.max` and `cpuset` documentation](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html).
+
+The service builds this layout inside its own systemd cgroup:
+
+```
+/sys/fs/cgroup/system.slice/agent-guard.service/
+    supervisor/       the service itself, outside the CPU cap
+    capped/           cpu.max and cpuset.cpus
+        control/      one group per agent session and its helpers
+        work/         one group per workload
+```
+
+The CPU limits live on `capped`, not on the service cgroup. systemd owns the service cgroup's own settings and rewrites them on `systemctl daemon-reload`, but it never changes the groups a delegated service creates below it. The supervisor runs outside `capped`, so the cap never slows it down. The service reads `cpu.max` back from the kernel once per second by default, and `agent-guard status` reports `cpu_cap_active: false` as soon as the quota no longer matches the configuration. `CPUQuota=` and `AllowedCPUs=` on `agent-guard.service` are not supported: the service lifts both limits from its own cgroup at every start and takes the cap only from `cpu_fraction` in `/etc/agent-guard.json`.
 
 ## Existing orphan processes
 
@@ -103,6 +115,8 @@ State and logs are stored in `/var/lib/agent-guard/`, in root-owned files that a
 To disable the service persistently, run `sudo systemctl disable --now agent-guard.service`. Files can remain in place to preserve diagnostics. Do not delete populated cgroups or erase state: it contains protections for existing workloads. To update, stop the service, replace only the root-owned code files and service unit, run `systemctl daemon-reload`, and restart. Preserve the configuration file and state.
 
 The installer also provides `sudo python3 install.py --update`, which reruns event tests, stops the supervisor, replaces the code and unit, and restarts without erasing configuration or state.
+
+Releases before the `capped` group kept `control` and `work` directly in the service cgroup and wrote the CPU limits on the service cgroup itself. The first start after updating from such a release lifts those limits, moves every process of the old groups into `capped` with the usual identity checks, and removes the emptied groups. A group whose move is ambiguous is quarantined, like any other ambiguous migration.
 
 Moving a process into a system cgroup can change the session association used by Polkit: `pkexec` launched from a tracked agent may no longer find its graphical authentication agent. Authentication remains available from an untracked user terminal. For an administrative command initiated by an agent, this pattern has been verified:
 

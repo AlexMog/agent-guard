@@ -8,6 +8,9 @@ import time
 from .model import is_agent, is_helper
 
 
+CGROUP_FS = Path('/sys/fs/cgroup')
+
+
 class UnsafeAction(RuntimeError):
     pass
 
@@ -35,6 +38,7 @@ class Cgroups:
     def __init__(self, root, proc):
         self.root = Path(root)
         self.proc = proc
+        self.cpu_limit = None
 
     @classmethod
     def delegated(cls, proc, cpu_fraction):
@@ -44,14 +48,15 @@ class Cgroups:
         # On restart the supervisor initially enters the service root again.
         relative = own.cgroup.removesuffix('/supervisor')
         validate_location(relative, os.geteuid())
-        root = Path('/sys/fs/cgroup') / relative.lstrip('/')
+        root = CGROUP_FS / relative.lstrip('/')
         if (Path(relative).name not in ('agent-guard.service', 'agent-guard-integration-test.service')
                 or not root.is_dir()):
             raise RuntimeError('a dedicated delegated systemd service is required')
         st = root.stat()
         if st.st_uid != os.geteuid() or st.st_mode & 0o022:
             raise UnsafeAction('delegation root is not exclusively writable by supervisor owner')
-        result = cls(root, proc)
+        # systemd rewrites the unit's own limits on daemon-reload but never touches its subgroups.
+        result = cls(root / 'capped', proc)
         supervisor = root / 'supervisor'
         supervisor.mkdir(exist_ok=True)
         (supervisor / 'cgroup.procs').write_text(str(os.getpid()))
@@ -62,11 +67,18 @@ class Cgroups:
         if 'cpuset' in (root / 'cgroup.controllers').read_text().split():
             controllers += ' +cpuset'
         (root / 'cgroup.subtree_control').write_text(controllers)
-        for name in ('control', 'work'):
-            group = root / name
+        for group in (result.root, result.root / 'control', result.root / 'work'):
             group.mkdir(exist_ok=True)
             (group / 'cgroup.subtree_control').write_text(controllers)
         (supervisor / 'cpu.weight').write_text('10000')
+        # Older versions capped the unit cgroup itself; lift those limits.
+        defaults = {root / 'cpu.max': 'max 100000', root / 'work' / 'cpu.max': 'max 100000'}
+        if (root / 'cpuset.cpus').exists():
+            defaults[root / 'cpuset.cpus'] = (root.parent / 'cpuset.cpus.effective').read_text()
+        for path, value in defaults.items():
+            current = path.read_text().strip() if path.exists() else ''
+            if current and current != value.strip():
+                path.write_text(value)
         result.configure_cpu(cpu_fraction, require_cpuset=os.geteuid() == 0)
         # Intentionally no memory.max on the shared tree: no arbitrary OOM victim.
         return result
@@ -90,12 +102,12 @@ class Cgroups:
         quota = max(1000, round(capacity * 100000))
         # The common ancestor covers new children still in control, too.
         settings[self.root / 'cpu.max'] = f'{quota} 100000'
-        # Remove the old work-only limit during upgrades.
         settings[self.root / 'work' / 'cpu.max'] = 'max 100000'
         original = {path: path.read_text() for path in settings}
         try:
             for path, value in settings.items():
                 path.write_text(value)
+            self.cpu_limit = settings[self.root / 'cpu.max']
         except OSError:
             for path, value in original.items():
                 try:
@@ -109,8 +121,43 @@ class Cgroups:
             raise
 
     @property
+    def cpu_capped(self):
+        try:
+            return self.cpu_limit is not None and (self.root / 'cpu.max').read_text().strip() == self.cpu_limit
+        except OSError:
+            return False
+
+    @property
     def relative(self):
-        return '/' + str(self.root.relative_to('/sys/fs/cgroup'))
+        return '/' + str(self.root.relative_to(CGROUP_FS))
+
+    def legacy_groups(self):
+        """Session and job groups that older versions kept directly beside supervisor."""
+        unit = self.root.parent
+        names = {'control': r'a-\d+-\d+', 'work': r'j-\d+-\d+'}
+        return [group for area, name in names.items() if (unit / area).is_dir()
+                for group in (unit / area).iterdir() if group.is_dir() and re.fullmatch(name, group.name)]
+
+    def adopt(self, groups):
+        """Move legacy groups under this root by name; return {group name: error} for ambiguous moves."""
+        ambiguous = {}
+        for group in groups:
+            if (group / 'cgroup.freeze').exists():
+                (group / 'cgroup.freeze').write_text('0')
+            location = '/' + str(group.relative_to(CGROUP_FS))
+            for pid in self.pids(group):
+                p = self.proc.read(pid)
+                try:
+                    if p and p.cgroup == location:
+                        self.attach(p, self.root / group.parent.name / group.name)
+                except (OSError, UnsafeAction) as exc:
+                    ambiguous[group.name] = str(exc)
+        for path in (*groups, self.root.parent / 'control', self.root.parent / 'work'):
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+        return ambiguous
 
     def job_path(self, jid):
         if not re.fullmatch(r'j-\d+-\d+', jid):
