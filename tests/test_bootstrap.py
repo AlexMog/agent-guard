@@ -87,6 +87,11 @@ exit "${TEST_INSTALL_EXIT:-0}"''')
         self.assertIn(f'<--uid> <{self.target_uid}> <--enforce-new>', self.calls())
         self.assert_clean()
 
+    def test_privileged_installer_never_writes_bytecode_into_download(self):
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('<--> </usr/bin/env> <PYTHONDONTWRITEBYTECODE=1> </usr/bin/python3>', self.calls())
+
     def test_observation_option_does_not_enable_limits(self):
         result = self.run_script('--observe')
         self.assertEqual(result.returncode, 0, result.stderr)

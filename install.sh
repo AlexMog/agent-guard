@@ -5,7 +5,7 @@
 set -euo pipefail
 
 main() {
-    local source_commit=d21b14efb716c17425425412e76dfe4d6e249dee
+    local source_commit=8af077b79e2396b7c76d1f86a886db5c3e7cf768
     local target_uid='' observe=0 check=0 current_uid systemd_version temp_dir source_dir
     local -a installer_args elevate=()
 
@@ -128,7 +128,9 @@ PY
     else
         printf 'Installing for UID %s. Administrator authentication may be requested.\n' "$target_uid"
         # Downloads stay private, but the installed CLI must be user-accessible.
-        (umask 022; "${elevate[@]}" /usr/bin/python3 "$source_dir/install.py" "${installer_args[@]}")
+        # Root-owned bytecode in the user's temporary tree would make cleanup fail.
+        (umask 022; "${elevate[@]}" /usr/bin/env PYTHONDONTWRITEBYTECODE=1 \
+            /usr/bin/python3 "$source_dir/install.py" "${installer_args[@]}")
         printf 'Agent Guard is ready. Run: agent-guard status\n'
     fi
     # Clean up before local variables leave scope; EXIT also handles failures.
