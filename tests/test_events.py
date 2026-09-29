@@ -341,6 +341,32 @@ class PumpTests(unittest.TestCase):
         self.assertEqual(stream.close_count, 1)
         self.assertFalse(stream.concurrent_close)
 
+    def test_failure_is_none_while_healthy_and_names_a_latched_loss(self):
+        pump, stream = self.open_pump()
+        self.assertIsNone(pump.failure)
+        stream.queue.put(events.EventLoss('sequence gap'))
+        stream.drained(self)
+        self.assertEqual(pump.failure, 'sequence gap')
+
+    def test_reader_exit_without_loss_is_reported_as_failure(self):
+        pump = events.EventPump(stream=ExitingStream())
+        self.addCleanup(pump.close)
+        deadline = time.monotonic() + 2
+        while pump.healthy and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(pump.healthy)
+        self.assertEqual(pump.failure, 'process event reader exited without reporting a loss')
+
+    def test_closed_pump_reports_why_it_is_unhealthy(self):
+        pump, _ = self.open_pump()
+        pump.close()
+        self.assertEqual(pump.failure, 'process event reader was closed')
+
+
+class ExitingStream(FakeStream):
+    def receive(self, timeout):
+        raise SystemExit
+
 
 @unittest.skipUnless(os.environ.get('AGENT_GUARD_PROC_INTEGRATION') == '1',
                      'set AGENT_GUARD_PROC_INTEGRATION=1 as root for real kernel events')

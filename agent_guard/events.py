@@ -237,10 +237,21 @@ class EventPump:
             raise
 
     @property
+    def failure(self):
+        """Why refresh hints can no longer be trusted, or None while healthy."""
+        with self._condition:
+            if self._failure is not None:
+                return self._failure
+            if self._stop.is_set():
+                return 'process event reader was closed'
+            if not self._thread.is_alive():
+                return 'process event reader exited without reporting a loss'
+            return None
+
+    @property
     def healthy(self):
         """Thread-safe pre-action check; false once any loss has been observed."""
-        with self._condition:
-            return self._failure is None and not self._stop.is_set() and self._thread.is_alive()
+        return self.failure is None
 
     def _fail(self, reason):
         with self._condition:
