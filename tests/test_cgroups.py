@@ -30,6 +30,12 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaises(UnsafeAction):
             validate_members([self.agent, self.work], self.r, self.job)
 
+    def test_managed_codex_daemon_aborts_even_with_stale_workload_membership(self):
+        from dataclasses import replace
+        daemon = replace(self.work, exe='/home/developer/.codex/packages/app-server-daemon/releases/0.160.0-x86_64-unknown-linux-musl/bin/codex')
+        with self.assertRaises(UnsafeAction):
+            validate_members([daemon], self.r, self.job)
+
     def test_empty_group_aborts(self):
         with self.assertRaises(UnsafeAction):
             validate_members([], self.r, self.job)

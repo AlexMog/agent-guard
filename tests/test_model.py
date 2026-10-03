@@ -4,6 +4,7 @@ from agent_guard.policy import choose_victim, Gate
 
 
 AGENT = '/home/developer/.local/share/claude/versions/2.1.257'
+CODEX_DAEMON = '/home/developer/.codex/packages/app-server-daemon/releases/0.160.0-x86_64-unknown-linux-musl/bin/codex'
 
 
 def proc(pid, ppid=1, start=None, exe='/usr/bin/bash', argv=(), cgroup=''):
@@ -18,6 +19,50 @@ class ModelTests(unittest.TestCase):
         self.assertTrue(is_agent(proc(10, exe=AGENT)))
         self.assertFalse(is_agent(proc(10, argv=('claude',))))
         self.assertFalse(is_agent(proc(10, exe='/tmp/claude')))
+
+    def test_codex_managed_release_is_agent_including_deleted_executable(self):
+        for suffix in ('', ' (deleted)'):
+            with self.subTest(suffix=suffix):
+                self.assertTrue(is_agent(proc(10, exe=CODEX_DAEMON + suffix)))
+
+    def test_codex_managed_release_lookalikes_are_not_agents(self):
+        for exe in ('/tmp/codex', CODEX_DAEMON + '-other',
+                    CODEX_DAEMON.replace('/releases/', '/downloads/'),
+                    CODEX_DAEMON.replace('/0.160.0-', '/unversioned-')):
+            with self.subTest(exe=exe):
+                self.assertFalse(is_agent(proc(10, exe=exe, argv=(CODEX_DAEMON,))))
+
+    def test_codex_daemon_separates_commands_and_protects_helpers(self):
+        r = Registry(1000, 'boot', 10)
+        daemon = proc(20, 10, exe=CODEX_DAEMON)
+        r.reconcile([proc(10, exe=AGENT), daemon, proc(30, 20), proc(40, 30),
+                     proc(50, 20), proc(60, 20, exe=CODEX_DAEMON + '-code-mode-host')])
+        self.assertTrue(r.members[daemon.key].agent)
+        self.assertIsNone(r.members[daemon.key].job)
+        self.assertEqual(r.members['30:300'].job, r.members['40:400'].job)
+        self.assertNotEqual(r.members['30:300'].job, r.members['50:500'].job)
+        self.assertTrue(r.members['60:600'].protected)
+        self.assertEqual(len(r.jobs), 2)
+
+    def test_restored_codex_daemon_job_is_split_preserving_workload_protection(self):
+        from dataclasses import replace
+        for baseline, tainted in ((False, False), (True, False), (False, True)):
+            with self.subTest(baseline=baseline, tainted=tainted):
+                r = Registry(1000, 'boot', 10)
+                daemon = proc(20, 10)
+                processes = [proc(10, exe=AGENT), daemon, proc(30, 20), proc(40, 30)]
+                r.reconcile(processes)
+                old_job = r.jobs[r.members[daemon.key].job]
+                old_job.baseline, old_job.tainted = baseline, tainted
+                r = Registry.restore(r.export(), 1000, 'boot', 9000)
+                processes[1] = replace(daemon, exe=CODEX_DAEMON, ppid=1)
+                r.reconcile(processes[1:])
+                self.assertTrue(r.members[daemon.key].agent)
+                self.assertIsNone(r.members[daemon.key].job)
+                new_job = r.jobs[r.members['30:300'].job]
+                self.assertEqual(new_job.session, 'a-20-200')
+                self.assertEqual((new_job.baseline, new_job.tainted), (baseline, tainted))
+                self.assertEqual(r.members['40:400'].job, new_job.id)
 
     def test_mcp_helper_and_descendants_never_jobs(self):
         r = self.registry()

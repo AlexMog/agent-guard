@@ -26,6 +26,7 @@ def is_agent(p):
     return bool(
         re.fullmatch(r'/home/[^/]+/\.local/share/claude/versions/[0-9][^/]*', exe)
         or re.fullmatch(r'/home/[^/]+/\.nvm/versions/node/[^/]+/lib/node_modules/@openai/(?:codex|\.codex-[^/]+)/node_modules/@openai/codex-linux-[^/]+/vendor/[^/]+/bin/codex', exe)
+        or re.fullmatch(r'/home/[^/]+/\.codex/packages/app-server-daemon/releases/[0-9][^/]*/bin/codex', exe)
     )
 
 
