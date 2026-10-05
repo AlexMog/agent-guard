@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
-from agent_guard.cgroups import Cgroups, UnsafeAction, validate_members, validate_location
+from agent_guard.cgroups import Cgroups, UnsafeAction, group_memory, validate_members, validate_location, whole_cores
 from agent_guard.model import Process, Registry
 
 
@@ -69,6 +69,51 @@ class SafetyTests(unittest.TestCase):
                 self.assertFalse(cg.attach(self.work, target))
             self.assertEqual(f.read_text(), 'original')
 
+    def test_children_forked_before_the_freeze_are_classified_then_signaled(self):
+        newborn = process(40, 20)
+        live = {p.pid: p for p in (self.work, newborn)}
+        steps = []
+        with tempfile.TemporaryDirectory() as d:
+            cg = Cgroups(Path(d), Mock(read=live.get))
+            def classify(pids):
+                steps.append('classify')
+                self.r.reconcile([self.agent, self.work, newborn])
+            record = Mock()
+            with patch.object(cg, 'freeze', side_effect=lambda path, frozen: steps.append(('freeze', frozen))), \
+                    patch.object(cg, 'members', return_value=[self.work, newborn]), \
+                    patch('os.pidfd_open', return_value=123), patch('os.close'), \
+                    patch('signal.pidfd_send_signal') as send:
+                self.job.pss, self.job.swap = 300, 200
+                cg.terminate(self.job, self.r, record, classify=classify)
+            self.assertEqual(steps, [('freeze', True), 'classify', ('freeze', False)])
+            self.assertEqual(send.call_count, 2)
+            self.assertEqual(record.call_args.kwargs['job_resident_bytes'], 300)
+            self.assertEqual(record.call_args.kwargs['job_swap_bytes'], 200)
+
+    def test_throttled_group_gets_time_to_freeze(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)
+            (path / 'cgroup.events').write_text('populated 1\nfrozen 0\n')
+            clock = [0.0]
+            def sleep(seconds):
+                clock[0] += seconds
+                if clock[0] >= 2.5:
+                    (path / 'cgroup.events').write_text('populated 1\nfrozen 1\n')
+            with patch('agent_guard.cgroups.time', Mock(monotonic=lambda: clock[0], sleep=sleep)):
+                Cgroups(path, Mock()).freeze(path, True)
+            self.assertGreaterEqual(clock[0], 2.5)
+
+    def test_group_that_never_freezes_is_never_signaled(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)
+            (path / 'cgroup.events').write_text('populated 1\nfrozen 0\n')
+            clock = [0.0]
+            def sleep(seconds):
+                clock[0] += seconds
+            with patch('agent_guard.cgroups.time', Mock(monotonic=lambda: clock[0], sleep=sleep)):
+                with self.assertRaises(UnsafeAction):
+                    Cgroups(path, Mock()).freeze(path, True)
+
     def test_invalid_members_never_signaled_and_group_is_thawed(self):
         with tempfile.TemporaryDirectory() as d:
             cg = Cgroups(Path(d), Mock())
@@ -93,6 +138,13 @@ class SafetyTests(unittest.TestCase):
 
 
 class CpuBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        patcher = patch('agent_guard.cgroups.CPU_SYSFS', Path(temp.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_shared_parent_caps_control_and_work_without_shrinking_on_restart(self):
         with tempfile.TemporaryDirectory() as d:
             parent = Path(d)
@@ -154,6 +206,99 @@ class CpuBoundaryTests(unittest.TestCase):
                 Cgroups(root, Mock()).configure_cpu(0.5)
 
 
+def smt_topology(root, cpus, cores):
+    for cpu in range(cpus):
+        topology = root / f'cpu{cpu}/topology'
+        topology.mkdir(parents=True)
+        (topology / 'thread_siblings_list').write_text(f'{cpu % cores},{cpu % cores + cores}\n')
+
+class WholeCoreTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.sysfs = Path(temp.name)
+        patcher = patch('agent_guard.cgroups.CPU_SYSFS', self.sysfs)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_half_cap_takes_whole_physical_cores_instead_of_one_thread_on_each(self):
+        smt_topology(self.sysfs, 16, 8)
+        self.assertEqual(whole_cores(set(range(16)), 8), [0, 1, 2, 3, 8, 9, 10, 11])
+
+    def test_odd_capacity_fills_whole_cores_before_a_single_thread(self):
+        smt_topology(self.sysfs, 16, 8)
+        self.assertEqual(whole_cores(set(range(16)), 3), [0, 1, 8])
+
+    def test_siblings_outside_the_parent_cpuset_are_never_chosen(self):
+        smt_topology(self.sysfs, 16, 8)
+        self.assertEqual(whole_cores({2, 3, 10}, 2), [2, 10])
+
+    def test_inconsistent_topology_never_repeats_a_cpu(self):
+        for cpu, siblings in ((0, '0,8'), (1, '0-1')):
+            topology = self.sysfs / f'cpu{cpu}/topology'
+            topology.mkdir(parents=True)
+            (topology / 'thread_siblings_list').write_text(siblings + '\n')
+        self.assertEqual(whole_cores(set(range(16)), 4), [0, 1, 2, 8])
+
+    def test_empty_parent_cpuset_is_reported_as_no_online_cpus(self):
+        (self.sysfs / 'parent').mkdir()
+        (self.sysfs / 'parent/cpuset.cpus.effective').write_text('\n')
+        root = self.sysfs / 'parent/guard'
+        (root / 'work').mkdir(parents=True)
+        (root / 'cpuset.cpus').touch()
+        with self.assertRaisesRegex(RuntimeError, 'no online CPUs'):
+            Cgroups(root, Mock()).configure_cpu(0.5)
+
+    def test_unknown_topology_falls_back_to_logical_order(self):
+        self.assertEqual(whole_cores(set(range(16)), 4), [0, 1, 2, 3])
+
+    def test_cpu_cap_cpuset_uses_whole_cores(self):
+        smt_topology(self.sysfs, 16, 8)
+        (self.sysfs / 'parent').mkdir()
+        (self.sysfs / 'parent/cpuset.cpus.effective').write_text('0-15\n')
+        root = self.sysfs / 'parent/guard'
+        (root / 'work').mkdir(parents=True)
+        for name in ('cpu.max', 'work/cpu.max'):
+            (root / name).write_text('max 100000')
+        (root / 'cpuset.cpus').touch()
+        with patch('os.cpu_count', return_value=16):
+            Cgroups(root, Mock()).configure_cpu(0.5)
+        self.assertEqual((root / 'cpuset.cpus').read_text(), '0,1,2,3,8,9,10,11')
+        self.assertEqual((root / 'cpu.max').read_text(), '800000 100000')
+
+class MemoryAccountingTests(unittest.TestCase):
+    def group(self, stat, swap=None):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        group = Path(temp.name)
+        (group / 'memory.stat').write_text(stat)
+        if swap is not None:
+            (group / 'memory.swap.current').write_text(swap)
+        return group
+
+    def test_resident_memory_is_anonymous_only_without_page_cache_or_tmpfs(self):
+        group = self.group('anon 100\nfile 5000\nshmem 20\nfile_mapped 9\nswapcached 0\n', '7\n')
+        self.assertEqual(group_memory(group), (100, 7))
+
+    def test_swap_cached_pages_are_counted_once(self):
+        group = self.group('anon 100\nshmem 0\nswapcached 30\n', '70\n')
+        self.assertEqual(group_memory(group), (100, 40))
+
+    def test_kernel_without_swap_accounting_counts_no_swap(self):
+        group = self.group('anon 100\nshmem 0\n')
+        self.assertEqual(group_memory(group), (100, 0))
+
+    def test_workload_memory_is_braked_at_the_budget_and_released(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'work').mkdir()
+            (root / 'work/memory.high').write_text('max\n')
+            cg = Cgroups(root, Mock())
+            cg.configure_memory(15 * 1024 ** 3)
+            self.assertEqual((root / 'work/memory.high').read_text(), str(15 * 1024 ** 3))
+            cg.release_memory()
+            self.assertEqual((root / 'work/memory.high').read_text(), 'max')
+
 UNIT = '/system.slice/agent-guard.service'
 
 
@@ -173,9 +318,10 @@ class CappedSubgroupTests(unittest.TestCase):
                  'capped/cpuset.cpus': '\n', 'capped/work/cpu.max': 'max 100000\n'}
         for name, text in files.items():
             (self.unit / name).write_text(text)
-        patcher = patch('agent_guard.cgroups.CGROUP_FS', self.fs)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for target, value in (('agent_guard.cgroups.CGROUP_FS', self.fs), ('agent_guard.cgroups.CPU_SYSFS', self.fs / 'cpu')):
+            patcher = patch(target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def delegated(self):
         proc = Mock()

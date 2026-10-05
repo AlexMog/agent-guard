@@ -4,11 +4,12 @@ import fcntl
 import os
 from pathlib import Path
 import signal
+import threading
 import time
-from .cgroups import CGROUP_FS, Cgroups, UnsafeAction
+from .cgroups import CGROUP_FS, Cgroups, UnsafeAction, measure_groups
 from .events import EventPump, EventLoss
 from .model import is_agent
-from .policy import Gate, choose_victim
+from .policy import Gate, choose_victim, footprint
 from .procfs import ProcFS
 from .runtime import measure, restore_registry
 from .storage import Store
@@ -37,6 +38,7 @@ class Daemon:
         self.complete = False
         self.last_scan = self.last_save = self.last_retry = float('-inf')
         self.last_message = ''
+        self.brake_error = None
 
     def connect(self):
         if self.events:
@@ -69,6 +71,7 @@ class Daemon:
             'sessions': self.registry.sessions,
             'jobs': [asdict(j) for j in self.registry.jobs.values() if j.id in active_jobs],
             'members': {k: asdict(m) for k, m in self.registry.members.items()},
+            'memory_brake_bytes': self.config.brake_bytes, 'memory_brake_error': self.brake_error,
             'last_message': self.last_message,
         })
         self.last_save = time.monotonic()
@@ -80,6 +83,17 @@ class Daemon:
                 self.cache[pid] = p
             else:
                 self.cache.pop(pid, None)
+
+    def apply_memory_brake(self):
+        """Writing memory.high reclaims down to it inside the write, which can take minutes."""
+        try:
+            self.cg.configure_memory(self.config.brake_bytes)
+        except OSError as exc:
+            self.brake_error = str(exc)
+
+    def classify(self, pids):
+        self.refresh(pids)
+        self.registry.reconcile(self.cache.values())
 
     def quarantine(self, group):
         """Any ambiguous attachment inhibits automatic termination for the job."""
@@ -166,16 +180,10 @@ class Daemon:
         self.registry.sessions = {k: v for k, v in self.registry.sessions.items() if k in sessions}
 
     def sample(self):
-        self.total, self.complete, self.swap = measure(self.registry, self.proc)
         if self.cg:
-            # Unreadable or not-yet-discovered live group members prohibit action.
-            for jid in self.registry.jobs:
-                for pid in self.cg.pids(self.cg.job_path(jid)):
-                    p = self.proc.read(pid)
-                    if p and p.state == 'Z':
-                        continue
-                    if not p or p.key not in self.registry.members:
-                        self.complete = False
+            self.total, self.complete, self.swap = measure_groups(self.registry.jobs.values(), self.cg.job_path)
+        else:
+            self.total, self.complete, self.swap = measure(self.registry, self.proc)
         now = time.monotonic()
         if self.config.mode != 'enforce' or not self.event_ok or not getattr(self.events, 'healthy', False):
             self.gate.count = 0
@@ -187,27 +195,31 @@ class Daemon:
                 try:
                     if job and self.cg.pids(self.cg.job_path(jid)):
                         self.cg.terminate(job, self.registry, self.store.record, force=True,
-                                          authorize=lambda: self.event_ok and self.events.healthy)
+                                          authorize=lambda: self.event_ok and self.events.healthy,
+                                          classify=self.classify)
                 except (OSError, UnsafeAction) as exc:
                     self.store.record('kill-aborted', job=jid, error=str(exc))
                 self.pending = None
             return
-        if not self.gate.ready(now, self.total > self.config.memory_bytes, self.complete):
+        total = self.total + self.swap
+        if not self.gate.ready(now, total > self.config.memory_bytes, self.complete):
             return
-        job = choose_victim(self.registry.jobs.values(), self.total, self.config.memory_bytes,
+        job = choose_victim(self.registry.jobs.values(), total, self.config.memory_bytes,
                             self.complete, self.config.minimum_job_bytes)
         self.gate.acted(now)
         if not job:
             self.last_message = 'Budget exceeded; no eligible new verified job. Existing work remains protected.'
-            self.store.record('over-budget-no-safe-victim', total_bytes=self.total, limit_bytes=self.config.memory_bytes)
+            self.store.record('over-budget-no-safe-victim', total_bytes=self.total, swap_bytes=self.swap,
+                              limit_bytes=self.config.memory_bytes)
             return
         try:
-            self.store.record('memory-decision', job=job.id, total_bytes=self.total,
-                              limit_bytes=self.config.memory_bytes, policy='newest-verified-nonbaseline-job')
+            self.store.record('memory-decision', job=job.id, job_bytes=footprint(job), total_bytes=self.total,
+                              swap_bytes=self.swap, limit_bytes=self.config.memory_bytes,
+                              policy='largest-verified-nonbaseline-job')
             self.cg.terminate(job, self.registry, self.store.record,
-                              authorize=lambda: self.event_ok and self.events.healthy)
+                              authorize=lambda: self.event_ok and self.events.healthy, classify=self.classify)
             self.pending = (job.id, now + self.config.terminate_grace_seconds)
-            self.last_message = f'{job.id}: TERM sent because shared work PSS exceeded budget'
+            self.last_message = f'{job.id}: TERM sent because workload memory and swap exceeded budget'
         except (OSError, UnsafeAction) as exc:
             self.last_message = f'{job.id}: action aborted: {exc}'
             self.store.record('termination-aborted', job=job.id, error=str(exc))
@@ -221,6 +233,7 @@ class Daemon:
         try:
             if self.config.mode == 'enforce':
                 self.cg = Cgroups.delegated(self.proc, self.config.cpu_fraction)
+                threading.Thread(target=self.apply_memory_brake, daemon=True).start()
                 self.registry.group_prefix = self.cg.relative
                 self.cg.thaw_all()
             self.reconcile(full=True)
@@ -265,8 +278,11 @@ class Daemon:
             if self.events:
                 self.events.close()
             if self.cg:
-                self.cg.thaw_all()
-                self.cg.release_cpu()
+                for step in ('thaw_all', 'release_cpu', 'release_memory'):
+                    try:
+                        getattr(self.cg, step)()
+                    except OSError as exc:
+                        self.store.record('release-failed', step=step, error=str(exc))
             self.save()
-            self.store.record('stopped', action='workloads-retained-cpu-quota-released')
+            self.store.record('stopped', action='workloads-retained-limits-released')
             os.close(self.lock)

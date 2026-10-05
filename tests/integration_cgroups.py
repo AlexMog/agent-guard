@@ -19,7 +19,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent_guard.cgroups import Cgroups
+from agent_guard.cgroups import Cgroups, measure_groups
 from agent_guard.model import Job, Member, Registry
 from agent_guard.policy import choose_victim
 from agent_guard.procfs import ProcFS
@@ -38,6 +38,21 @@ if mode == 'memory':
         memory[index] = 1
 print('READY', flush=True)
 command = sys.stdin.readline()
+late_mib = {'memory': 32, 'late-memory': 128}.get(mode)
+if late_mib and command == 'allocate\n':
+    late = bytearray(late_mib * 1024 * 1024)
+    for index in range(0, len(late), 4096):
+        late[index] = 1
+    print('ALLOCATED', flush=True)
+    sys.stdin.readline()
+if mode == 'pressure' and command == 'go\n':
+    chunks = []
+    while True:
+        if len(chunks) < 64:
+            chunks.append(bytearray(4 * 1024 * 1024))
+        for chunk in chunks:
+            for index in range(0, len(chunk), 4096):
+                chunk[index] = (chunk[index] + 1) % 256
 if mode == 'burn' and command == 'go\n':
     wall_start, cpu_start = time.monotonic(), time.process_time()
     value = 1
@@ -152,6 +167,13 @@ def run():
         job.pss, job.swap = memory
         print(f'PASS: attachment and post-migration PSS ({job.pss} bytes)', flush=True)
 
+        high = cg.root / 'work' / 'memory.high'
+        cg.configure_memory(1024 ** 3)
+        require(high.read_text().strip() == str(1024 ** 3), 'memory.high was not applied to workloads')
+        cg.release_memory()
+        require(high.read_text().strip() == 'max', 'memory.high was not released')
+        print('PASS: workload memory.high applied and released', flush=True)
+
         quota = (cg.root / 'cpu.max').read_text().split()
         require(quota == ['25000', '100000'], f'unexpected cpu.max: {quota}')
         burner, burner_identity = spawn('burn')
@@ -172,40 +194,37 @@ def run():
                 f'CPU quota did not constrain actual process CPU time: {measurement}')
         print(f'PASS: cpu.max and effective throttling ({measurement})', flush=True)
 
-        # Use the already allocated worker as the older job. Wait beyond a
-        # kernel clock tick so newest selection cannot accidentally rely on PID
-        # ordering when both children have the same /proc start timestamp.
-        time.sleep(max(0.03, 2 / os.sysconf('SC_CLK_TCK')))
-        newer, newer_identity = spawn('memory')
-        require(newer_identity.start > worker_identity.start,
-                'test children must have distinct, ordered birth timestamps')
-        newer_job, newer_path, newer_migrated = attach(newer_identity)
-        older_memory = proc.memory(migrated)
-        newer_memory = proc.memory(newer_migrated)
-        require(older_memory is not None and newer_memory is not None,
-                'cannot obtain complete PSS samples for both test jobs')
-        job.pss, job.swap = older_memory
-        newer_job.pss, newer_job.swap = newer_memory
-        require(min(job.pss, newer_job.pss) >= 60 * 1024 * 1024,
-                'both test children must retain their touched 64 MiB allocations')
+        # Allocations made before migration stay charged to the group where they happened.
+        worker.stdin.write('allocate\n')
+        worker.stdin.flush()
+        require(line_from(worker) == 'ALLOCATED', 'worker post-migration allocation did not complete')
+        newer, newer_identity = spawn('late-memory')
+        newer_job, newer_path, _ = attach(newer_identity)
+        newer.stdin.write('allocate\n')
+        newer.stdin.flush()
+        require(line_from(newer) == 'ALLOCATED', 'post-migration allocation did not complete')
+        total, complete, swap = measure_groups([job, newer_job], cg.job_path)
+        require(complete, 'kernel accounting of the test groups was unreadable')
+        require(newer_job.pss >= 120 * 1024 * 1024 and job.pss >= 30 * 1024 * 1024,
+                f'post-migration allocations missing from group accounting: {newer_job.pss}, {job.pss}')
         test_budget = 100 * 1024 * 1024
-        total_pss = job.pss + newer_job.pss
-        require(total_pss > test_budget, 'controlled combined PSS did not exceed the test budget')
+        footprint = total + swap
+        require(footprint > test_budget, 'controlled group memory did not exceed the test budget')
 
         def select_over_budget():
-            return choose_victim([job, newer_job], total_pss, test_budget,
+            return choose_victim([job, newer_job], footprint, test_budget,
                                  complete=True, min_bytes=1)
 
-        require(select_over_budget() is newer_job, 'budget policy did not select the newest job')
+        require(select_over_budget() is newer_job, 'budget policy did not select the largest job')
         newer_job.baseline = True
-        require(select_over_budget() is job, 'baseline exemption did not protect the newest job')
+        require(select_over_budget() is job, 'baseline exemption did not protect the largest job')
         newer_job.baseline = False
         victim = select_over_budget()
-        require(victim is newer_job, 'restored candidate did not become the newest victim')
+        require(victim is newer_job, 'restored candidate did not become the largest victim')
         audit_before_budget = len(audit)
         cg.terminate(victim, registry, record)
         require(newer.wait(timeout=3) == -signal.SIGTERM,
-                'budget-selected newest job did not exit from targeted TERM')
+                'budget-selected largest job did not exit from targeted TERM')
         require(len(audit) == audit_before_budget + 1
                 and audit[-1]['action'] == 'terminate'
                 and audit[-1]['job'] == newer_job.id
@@ -217,12 +236,12 @@ def run():
         manual_after = proc.read(manual.pid)
         require(worker.poll() is None and older_after is not None
                 and older_after.key == worker_identity.key,
-                'older job was affected by newest-job budget termination')
+                'smaller job was affected by largest-job budget termination')
         require(manual.poll() is None and manual_after is not None
                 and manual_after.key == manual_identity.key,
-                'manual sibling was affected by newest-job budget termination')
-        print(f'PASS: {total_pss} bytes PSS > 100 MiB test budget, newest selection, '
-              'baseline exemption, targeted TERM, older job and manual sibling alive', flush=True)
+                'manual sibling was affected by largest-job budget termination')
+        print(f'PASS: {footprint} bytes of group memory > 100 MiB test budget, largest selection, '
+              'baseline exemption, targeted TERM, smaller job and manual sibling alive', flush=True)
 
         cg.freeze(path, True)
         require(fields(path / 'cgroup.events').get('frozen') == '1', 'freeze not acknowledged')
@@ -248,6 +267,26 @@ def run():
         require([item['action'] for item in audit] == ['terminate', 'terminate', 'terminate', 'kill'],
                 'unexpected termination audit sequence')
         print('PASS: TERM refusal, forced KILL and untouched manual sibling', flush=True)
+
+        pressure, pressure_identity = spawn('pressure')
+        pressure_job, pressure_path, _ = attach(pressure_identity)
+        # Without swap the kernel's over-high penalty reaches its 2 s maximum, the worst case for freezing.
+        (pressure_path / 'memory.swap.max').write_text('0')
+        events = cg.root / 'work' / 'memory.events'
+        throttled = int(fields(events)['high'])
+        cg.configure_memory(32 * 1024 * 1024)
+        try:
+            pressure.stdin.write('go\n')
+            pressure.stdin.flush()
+            deadline = time.monotonic() + 10
+            while int(fields(events)['high']) - throttled < 50 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            require(int(fields(events)['high']) - throttled >= 50, 'workload was never throttled by memory.high')
+            cg.terminate(pressure_job, registry, record)
+            require(pressure.wait(timeout=5) == -signal.SIGTERM, 'job throttled by memory.high did not exit from TERM')
+        finally:
+            cg.release_memory()
+        print('PASS: freeze and TERM of a job throttled by memory.high', flush=True)
         return 0
     finally:
         # Thaw only known test-created groups. Kill only unreaped Popen children:

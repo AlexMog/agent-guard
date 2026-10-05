@@ -248,6 +248,18 @@ class PolicyTests(unittest.TestCase):
         jobs = self.jobs()
         self.assertEqual(choose_victim(jobs, total=200, limit=150, complete=True, min_bytes=50).root_pid, 30)
 
+    def test_largest_footprint_wins_with_swap_counted(self):
+        jobs = self.jobs()
+        jobs[0].pss, jobs[0].swap = 100, 300
+        jobs[1].pss, jobs[1].swap = 300, 0
+        self.assertEqual(choose_victim(jobs, 700, 150, True, 50).root_pid, 20)
+
+    def test_mostly_swapped_out_job_is_still_eligible(self):
+        jobs = self.jobs()
+        jobs[0].pss, jobs[0].swap = 10, 100
+        jobs[1].pss, jobs[1].swap = 10, 0
+        self.assertEqual(choose_victim(jobs, 200, 150, True, 50).root_pid, 20)
+
     def test_baseline_protected_and_tainted_never_selected(self):
         jobs = self.jobs()
         jobs[1].baseline = True

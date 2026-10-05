@@ -1,11 +1,15 @@
-"""No side effects: newest eligible work wins, never an arbitrary process."""
+"""No side effects: the largest eligible workload wins, never an arbitrary process."""
+
+
+def footprint(job):
+    return job.pss + job.swap
 
 
 def choose_victim(jobs, total, limit, complete, min_bytes):
     if not complete or total <= limit:
         return None
-    candidates = [j for j in jobs if not j.baseline and not j.tainted and j.pss >= min_bytes]
-    return max(candidates, key=lambda j: (j.start, j.root_pid), default=None)
+    candidates = [j for j in jobs if not j.baseline and not j.tainted and footprint(j) >= min_bytes]
+    return max(candidates, key=lambda j: (footprint(j), j.start, j.root_pid), default=None)
 
 
 class Gate:

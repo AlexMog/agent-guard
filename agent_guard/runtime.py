@@ -17,6 +17,10 @@ class Config:
     minimum_job_bytes: int = 64 * 1024 ** 2
     terminate_grace_seconds: float = 3
 
+    @property
+    def brake_bytes(self):
+        return self.memory_bytes + self.memory_bytes // 10
+
     def __post_init__(self):
         if not isinstance(self.uid, int) or self.uid <= 0:
             raise ValueError('target must be an explicit non-root UID')

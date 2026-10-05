@@ -9,6 +9,60 @@ from .model import is_agent, is_helper
 
 
 CGROUP_FS = Path('/sys/fs/cgroup')
+CPU_SYSFS = Path('/sys/devices/system/cpu')
+
+
+def parse_cpus(text):
+    cpus = set()
+    for item in filter(None, text.strip().split(',')):
+        bounds = [int(x) for x in item.split('-')]
+        cpus.update(range(bounds[0], bounds[-1] + 1))
+    return cpus
+
+
+def thread_siblings(cpu):
+    try:
+        return parse_cpus((CPU_SYSFS / f'cpu{cpu}' / 'topology' / 'thread_siblings_list').read_text())
+    except OSError:
+        return {cpu}
+
+
+def whole_cores(available, count):
+    """Fill physical cores completely: a half cap must leave whole cores free, not one SMT thread on each."""
+    chosen = set()
+    for cpu in sorted(available):
+        if len(chosen) >= count:
+            break
+        if cpu not in chosen:
+            chosen.update(sorted(((thread_siblings(cpu) | {cpu}) & available) - chosen)[:count - len(chosen)])
+    return sorted(chosen)
+
+
+def group_memory(path):
+    stat = dict(line.split() for line in (path / 'memory.stat').read_text().splitlines())
+    try:
+        swap = int((path / 'memory.swap.current').read_text())
+    except FileNotFoundError:
+        swap = 0
+    # Swap-cached pages are resident in anon and still hold their swap slot.
+    return int(stat['anon']), max(0, swap - int(stat.get('swapcached', 0)))
+
+
+def measure_groups(jobs, job_path):
+    """Kernel accounting includes members forked since the last scan, so busy groups stay measurable."""
+    total, complete, swap = 0, True, 0
+    for job in jobs:
+        job.pss = job.swap = 0
+        path = job_path(job.id)
+        if not path.is_dir():
+            continue
+        try:
+            job.pss, job.swap = group_memory(path)
+        except OSError:
+            complete = False
+        total += job.pss
+        swap += job.swap
+    return total, complete, swap
 
 
 class UnsafeAction(RuntimeError):
@@ -91,11 +145,8 @@ class Cgroups:
         settings = {}
         if cpuset.exists():
             # Read the parent, not our previous restriction, on restart.
-            available = set()
-            for item in (self.root.parent / 'cpuset.cpus.effective').read_text().strip().split(','):
-                bounds = [int(x) for x in item.split('-')]
-                available.update(range(bounds[0], bounds[-1] + 1))
-            chosen = sorted(available)[:max(1, int(capacity))]
+            available = parse_cpus((self.root.parent / 'cpuset.cpus.effective').read_text())
+            chosen = whole_cores(available, max(1, int(capacity)))
             if not chosen:
                 raise RuntimeError('no online CPUs available in parent cgroup')
             settings[cpuset] = ','.join(map(str, chosen))
@@ -119,6 +170,12 @@ class Cgroups:
                 except OSError:
                     pass
             raise
+
+    def configure_memory(self, memory_bytes):
+        (self.root / 'work' / 'memory.high').write_text(str(memory_bytes))
+
+    def release_memory(self):
+        (self.root / 'work' / 'memory.high').write_text('max')
 
     @property
     def cpu_capped(self):
@@ -211,7 +268,8 @@ class Cgroups:
     def freeze(self, path, frozen):
         (path / 'cgroup.freeze').write_text('1' if frozen else '0')
         if frozen:
-            deadline = time.monotonic() + 0.5
+            # The kernel's over-memory.high penalty can delay freezing by up to 2 seconds.
+            deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
                 events = dict(line.split() for line in (path / 'cgroup.events').read_text().splitlines())
                 if events.get('frozen') == '1':
@@ -219,12 +277,14 @@ class Cgroups:
                 time.sleep(0.005)
             raise UnsafeAction('group did not freeze; no signals sent')
 
-    def terminate(self, job, registry, record, force=False, authorize=None):
+    def terminate(self, job, registry, record, force=False, authorize=None, classify=None):
         """Freeze creates stable membership; pidfds bind TERM to the checked identities."""
         path = self.job_path(job.id)
         handles = []
         try:
             self.freeze(path, True)
+            if classify is not None:
+                classify(self.pids(path))
             members = validate_members(self.members(path), registry, job)
             for p in members:
                 fd = os.pidfd_open(p.pid)
@@ -235,7 +295,7 @@ class Cgroups:
             # Durable audit callback must succeed before the first signal.
             record('kill' if force else 'terminate', job=job.id,
                    session=job.session, reason='memory-budget-exceeded',
-                   pids=[p.pid for p in members], job_pss_bytes=job.pss, phase='intent')
+                   pids=[p.pid for p in members], job_resident_bytes=job.pss, job_swap_bytes=job.swap, phase='intent')
             if authorize is not None and not authorize():
                 raise UnsafeAction('event stream became unhealthy before signal; action aborted')
             for p, fd in handles:

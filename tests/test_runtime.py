@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from agent_guard.runtime import Config, measure, restore_registry
 from agent_guard.model import Process, Registry
 
@@ -65,19 +65,21 @@ class RuntimeTests(unittest.TestCase):
         d.registry = self.registry()
         d.proc = Mock()
         d.events = Mock(healthy=True)
-        def read_memory(_):
+        def read_memory(jobs, job_path):
             d.events.healthy = False
-            return 200, 0
-        d.proc.memory.side_effect = read_memory
+            return 200, True, 0
         d.cg = Mock()
-        d.cg.pids.return_value = []
         d.event_ok = True
         d.pending = None
         d.gate = Mock()
         d.gate.ready.return_value = True
         d.store = Mock()
-        d.sample()
+        with patch('agent_guard.daemon.measure_groups', side_effect=read_memory):
+            d.sample()
         d.cg.terminate.assert_not_called()
+
+    def test_memory_brake_sits_ten_percent_above_the_kill_budget(self):
+        self.assertEqual(Config(memory_bytes=15 * 1024 ** 3).brake_bytes, int(16.5 * 1024 ** 3))
 
     def test_config_rejects_dangerous_or_unknown_options(self):
         for config in ({'uid': 0}, {'mode': 'kill-all'}, {'memory_bytes': 0}, {'cpu_fraction': 2}, {'observation_seconds': 0}, {'unexpected': True}):
